@@ -629,8 +629,15 @@ func (p *gateway) addEndpoints(f protocol.DebugEndpointer, endpoints map[string]
 	}
 }
 
-func setClusterName(etcdClient etcdIntf.Client, clusterName string) (err error) {
-	_, err = etcdClient.Put(context.Background(), "/gateway/cluster/name", clusterName)
+func (p *gateway) setClusterName(ctx context.Context, etcdClient etcdIntf.Client, clusterName string) (err error) {
+	for ctx.Err() == nil {
+		timeout, cancel := context.WithTimeout(ctx, *p.config.EtcdDialTimeout)
+		_, err = etcdClient.Put(timeout, "/gateway/cluster/name", clusterName)
+		cancel()
+		if err == nil {
+			break
+		}
+	}
 	return err
 }
 
@@ -663,15 +670,15 @@ func getTempEtcdClient(ctx context.Context, endpoints []string, etcdCfg *embetcd
 	return tempCli, closeCli, err
 }
 
-func handleClusterNameResponse(ctx context.Context, tempCli etcdIntf.Client, resp *etcdcli.GetResponse, clusterName string) (err error) {
+func (p *gateway) handleClusterNameResponse(ctx context.Context, tempCli etcdIntf.Client, resp *etcdcli.GetResponse, clusterName string) (err error) {
 	// if there is a key
-	if len(resp.Kvs) != 0 {
+	if resp != nil && len(resp.Kvs) != 0 {
 		// the key doesn't match
 		if string(resp.Kvs[0].Value) != clusterName {
 			err = fmt.Errorf("the configured cluster name '%s' does not match the existing cluster name '%s'", string(resp.Kvs[0].Value), clusterName)
 		}
 	} else {
-		err = setClusterName(tempCli, clusterName)
+		err = p.setClusterName(ctx, tempCli, clusterName)
 	}
 	return err
 }
@@ -683,18 +690,28 @@ func (p *gateway) checkForClusterNameConflict(ctx context.Context, etcdCfg *embe
 	// conflicts only occur if we're joining or a client
 	if etcdCfg != nil && etcdCfg.ClusterState == "join" || etcdCfg.ClusterState == "client" {
 
-		// get the a temporary cli for the cluster
-		tempCli, closeCli, err = getTempEtcdClient(ctx, etcdCfg.InitialCluster, etcdCfg)
-		defer closeCli()
+		for ctx.Err() == nil {
+			// get the a temporary cli for the cluster
+			tempCli, closeCli, err = getTempEtcdClient(ctx, etcdCfg.InitialCluster, etcdCfg)
 
-		var resp *etcdcli.GetResponse
-		if err == nil {
-			resp, err = tempCli.Get(ctx, "/gateway/cluster/name")
-		}
+			var resp *etcdcli.GetResponse
+			if err == nil {
+				timeout, cancel := context.WithTimeout(ctx, *p.config.EtcdDialTimeout)
+				resp, err = tempCli.Get(timeout, "/gateway/cluster/name")
+				cancel()
+			}
 
-		// handle cluster name stuff
-		if err == nil {
-			err = handleClusterNameResponse(ctx, tempCli, resp, etcdCfg.ClusterName)
+			// handle cluster name stuff
+			if err == nil {
+				err = p.handleClusterNameResponse(ctx, tempCli, resp, etcdCfg.ClusterName)
+			}
+
+			// close the temporary client
+			closeCli()
+
+			if err == nil {
+				break
+			}
 		}
 	}
 	return err
@@ -752,16 +769,16 @@ func (p *gateway) setupEtcd(ctx context.Context, loadedConfig *config.GatewayCon
 
 	// set up a timeout for the etcd server startup
 	timeout := ctx
-	if loadedConfig.EtcdServerStartTimeout != nil {
+	if etcdCfg.StartupGracePeriod != nil {
 		var cancel context.CancelFunc
-		timeout, cancel = context.WithTimeout(context.Background(), *loadedConfig.EtcdServerStartTimeout)
+		timeout, cancel = context.WithTimeout(context.Background(), *etcdCfg.StartupGracePeriod)
 		defer cancel()
 	}
 
 	var err error
 
 	// check the for cluster name conflicts
-	err = p.checkForClusterNameConflict(ctx, etcdCfg)
+	err = p.checkForClusterNameConflict(timeout, etcdCfg)
 
 	// start the server
 	if *loadedConfig.ClusterOperation != "client" && err == nil {
@@ -771,13 +788,13 @@ func (p *gateway) setupEtcd(ctx context.Context, loadedConfig *config.GatewayCon
 		if err == nil && etcdCfg.ClusterState == embed.ClusterStateFlagNew {
 			endpoints := embetcd.URLSToStringSlice(etcdCfg.ACUrls)
 			var tempCli *embetcd.Client
-			var cancel func()
-			tempCli, cancel, err = getTempEtcdClient(ctx, endpoints, etcdCfg)
-			defer cancel()
+			var closeCli func()
+			tempCli, closeCli, err = getTempEtcdClient(timeout, endpoints, etcdCfg)
+			defer closeCli()
 
 			// set the cluster name for new clusters
 			if err == nil {
-				err = setClusterName(tempCli, etcdCfg.ClusterName)
+				err = p.setClusterName(timeout, tempCli, etcdCfg.ClusterName)
 			}
 
 		}
